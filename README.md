@@ -39,8 +39,6 @@ Note that by default this module will listen on port 69 and serve the current wo
 A minimal configuration:
 
 ```json
-
-```json
 {
   "apps": {
     "tftp": {
