@@ -7,7 +7,7 @@ This is a Caddy App module that starts a TFTP server.
 Build with xcaddy:
 
 ```bash
-xcaddy build --with=github.com/lion7/caddy-tftp
+xcaddy build --with=github.com/lion7/caddytftp
 ```
 
 Optional: add capabilities to the binary to listen on privileged port 69:

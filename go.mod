@@ -1,4 +1,4 @@
-module github.com/lion7/caddy-tftp
+module github.com/lion7/caddytftp
 
 go 1.23.4
 
