@@ -2,11 +2,15 @@ package internal
 
 import (
 	"fmt"
-	"go.uber.org/zap"
+	"io"
 	"net"
+	"os"
+	"path"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
-	"go.universe.tf/netboot/tftp"
+	"github.com/pin/tftp/v3"
+	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -22,7 +26,7 @@ const CtxServerName caddySshServerCtxKey = "CtxServerName"
 type TFTP struct {
 	// The set of ssh servers keyed by custom names
 	Servers  map[string]*Server `json:"servers,omitempty"`
-	servers  []tftpServer
+	servers  []*tftpServer
 	ctx      caddy.Context
 	errGroup *errgroup.Group
 }
@@ -38,11 +42,19 @@ type Server struct {
 	// Default is current working directory.
 	// This should be a trusted value.
 	Root string `json:"root,omitempty"`
+
+	// How long to allow a read or write from a client.
+	// Duration can be an integer or a string.
+	// An integer is interpreted as nanoseconds.
+	// If a string, it is a Go time.Duration value such as 300ms, 1.5h, or 2h45m;
+	// valid units are ns, us/µs, ms, s, m, h, and d.
+	Timeout time.Duration `json:"timeout,omitempty"`
 }
 
 type tftpServer struct {
 	*tftp.Server
 	name string
+	root string
 	addr caddy.NetworkAddress
 	log  *zap.Logger
 }
@@ -58,6 +70,15 @@ func (TFTP) CaddyModule() caddy.ModuleInfo {
 func (app *TFTP) Provision(ctx caddy.Context) error {
 	app.ctx = ctx
 	for name, srv := range app.Servers {
+		root := srv.Root
+		if root == "" {
+			wd, err := os.Getwd()
+			if err != nil {
+				return err
+			}
+			root = wd
+		}
+
 		addr, err := caddy.ParseNetworkAddressWithDefaults(srv.Listen, "udp", 69)
 		if err != nil {
 			return err
@@ -65,21 +86,15 @@ func (app *TFTP) Provision(ctx caddy.Context) error {
 		if addr.Network != "udp" {
 			return fmt.Errorf("only 'udp' is supported in the listener addr")
 		}
-		for portOffset := uint(0); portOffset < addr.PortRangeSize(); portOffset++ {
-			handler, err := tftp.FilesystemHandler(srv.Root)
-			if err != nil {
-				return err
-			}
-			tftpServer := tftpServer{
-				Server: &tftp.Server{
-					Handler: handler,
-				},
-				name: name,
-				addr: addr,
-				log:  ctx.Logger().Named(name),
-			}
-			app.servers = append(app.servers, tftpServer)
+
+		tftpServer := &tftpServer{
+			name: name,
+			root: root,
+			addr: addr,
+			log:  ctx.Logger().Named(name),
 		}
+		tftpServer.Server = tftp.NewServer(tftpServer.readHandler, tftpServer.writeHandler)
+		app.servers = append(app.servers, tftpServer)
 	}
 	return nil
 }
@@ -87,18 +102,18 @@ func (app *TFTP) Provision(ctx caddy.Context) error {
 // Start starts the TFTP app.
 func (app *TFTP) Start() error {
 	app.errGroup = &errgroup.Group{}
-	for _, srv := range app.servers {
-		ln, err := srv.addr.Listen(app.ctx, 0, net.ListenConfig{})
+	for _, s := range app.servers {
+		ln, err := s.addr.Listen(app.ctx, 0, net.ListenConfig{})
 		if err != nil {
-			return fmt.Errorf("tftp: failed to listen on %s: %v", srv.addr, err)
+			return fmt.Errorf("tftp: failed to listen on %s: %v", s.addr, err)
 		}
 		l, ok := ln.(net.PacketConn)
 		if !ok {
-			return fmt.Errorf("tftp: failed to listen on %s: %v", srv.addr, err)
+			return fmt.Errorf("tftp: failed to listen on %s: %v", s.addr, err)
 		}
 		app.errGroup.Go(func() error {
-			srv.log.Info(fmt.Sprintf("listening on %s", srv.addr))
-			return srv.Serve(l)
+			s.log.Info(fmt.Sprintf("listening on %s", s.addr))
+			return s.Serve(l)
 		})
 	}
 	return nil
@@ -106,7 +121,44 @@ func (app *TFTP) Start() error {
 
 // Stop stops the TFTP app.
 func (app *TFTP) Stop() error {
+	for _, s := range app.servers {
+		s.Shutdown()
+	}
 	return app.errGroup.Wait()
+}
+
+// readHandler is called when client starts file download from server
+func (s *tftpServer) readHandler(filename string, rf io.ReaderFrom) error {
+	p := path.Join(s.root, filename)
+	file, err := os.Open(p)
+	if err != nil {
+		s.log.Error(err.Error())
+		return err
+	}
+	n, err := rf.ReadFrom(file)
+	if err != nil {
+		s.log.Error(err.Error())
+		return err
+	}
+	s.log.Info(fmt.Sprintf("%d bytes sent", n))
+	return nil
+}
+
+// writeHandler is called when client starts file upload to server
+func (s *tftpServer) writeHandler(filename string, wt io.WriterTo) error {
+	p := path.Join(s.root, filename)
+	file, err := os.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
+	if err != nil {
+		s.log.Error(err.Error())
+		return err
+	}
+	n, err := wt.WriteTo(file)
+	if err != nil {
+		s.log.Error(err.Error())
+		return err
+	}
+	s.log.Info(fmt.Sprintf("%d bytes received", n))
+	return nil
 }
 
 // Interface guards
