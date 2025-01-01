@@ -1,11 +1,13 @@
 package internal
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"os"
-	"path"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
@@ -43,7 +45,8 @@ type Server struct {
 	// This should be a trusted value.
 	Root string `json:"root,omitempty"`
 
-	// How long to allow a read or write from a client.
+	// The maximum time to wait for a single network round-trip to succeed.
+	// Default is 5 seconds.
 	// Duration can be an integer or a string.
 	// An integer is interpreted as nanoseconds.
 	// If a string, it is a Go time.Duration value such as 300ms, 1.5h, or 2h45m;
@@ -70,13 +73,9 @@ func (TFTP) CaddyModule() caddy.ModuleInfo {
 func (app *TFTP) Provision(ctx caddy.Context) error {
 	app.ctx = ctx
 	for name, srv := range app.Servers {
-		root := srv.Root
-		if root == "" {
-			wd, err := os.Getwd()
-			if err != nil {
-				return err
-			}
-			root = wd
+		root, err := filepath.Abs(srv.Root)
+		if err != nil {
+			return err
 		}
 
 		addr, err := caddy.ParseNetworkAddressWithDefaults(srv.Listen, "udp", 69)
@@ -87,14 +86,17 @@ func (app *TFTP) Provision(ctx caddy.Context) error {
 			return fmt.Errorf("only 'udp' is supported in the listener addr")
 		}
 
-		tftpServer := &tftpServer{
+		s := &tftpServer{
 			name: name,
 			root: root,
 			addr: addr,
 			log:  ctx.Logger().Named(name),
 		}
-		tftpServer.Server = tftp.NewServer(tftpServer.readHandler, tftpServer.writeHandler)
-		app.servers = append(app.servers, tftpServer)
+		tftpServer := tftp.NewServer(s.readHandler, s.writeHandler)
+		tftpServer.SetTimeout(srv.Timeout)
+		s.Server = tftpServer
+
+		app.servers = append(app.servers, s)
 	}
 	return nil
 }
@@ -112,7 +114,7 @@ func (app *TFTP) Start() error {
 			return fmt.Errorf("tftp: failed to listen on %s: %v", s.addr, err)
 		}
 		app.errGroup.Go(func() error {
-			s.log.Info(fmt.Sprintf("listening on %s", s.addr))
+			s.log.Info("tftp endpoint started", zap.String("address", s.addr.String()), zap.String("root", s.root))
 			return s.Serve(l)
 		})
 	}
@@ -123,21 +125,26 @@ func (app *TFTP) Start() error {
 func (app *TFTP) Stop() error {
 	for _, s := range app.servers {
 		s.Shutdown()
+		s.log.Info("tftp endpoint stopped", zap.String("address", s.addr.String()), zap.String("root", s.root))
 	}
 	return app.errGroup.Wait()
 }
 
 // readHandler is called when client starts file download from server
 func (s *tftpServer) readHandler(filename string, rf io.ReaderFrom) error {
-	p := path.Join(s.root, filename)
+	p, err := s.safePath(filename)
+	if err != nil {
+		s.log.Error(err.Error(), zap.String("filename", filename))
+		return err
+	}
 	file, err := os.Open(p)
 	if err != nil {
-		s.log.Error(err.Error())
+		s.log.Error(err.Error(), zap.String("filename", filename))
 		return err
 	}
 	n, err := rf.ReadFrom(file)
 	if err != nil {
-		s.log.Error(err.Error())
+		s.log.Error(err.Error(), zap.String("filename", filename))
 		return err
 	}
 	s.log.Info(fmt.Sprintf("%d bytes sent", n))
@@ -146,19 +153,33 @@ func (s *tftpServer) readHandler(filename string, rf io.ReaderFrom) error {
 
 // writeHandler is called when client starts file upload to server
 func (s *tftpServer) writeHandler(filename string, wt io.WriterTo) error {
-	p := path.Join(s.root, filename)
+	p, err := s.safePath(filename)
+	if err != nil {
+		s.log.Error(err.Error(), zap.String("filename", filename))
+		return err
+	}
 	file, err := os.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
 	if err != nil {
-		s.log.Error(err.Error())
+		s.log.Error(err.Error(), zap.String("filename", filename))
 		return err
 	}
 	n, err := wt.WriteTo(file)
 	if err != nil {
-		s.log.Error(err.Error())
+		s.log.Error(err.Error(), zap.String("filename", filename))
 		return err
 	}
 	s.log.Info(fmt.Sprintf("%d bytes received", n))
 	return nil
+}
+
+func (s *tftpServer) safePath(filename string) (string, error) {
+	p := filepath.Join(s.root, filename)
+	c, err := filepath.Abs(p)
+	if err != nil || !strings.HasPrefix(c, s.root) {
+		return c, errors.New("unsafe or invalid filename specified")
+	} else {
+		return c, nil
+	}
 }
 
 // Interface guards
