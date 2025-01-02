@@ -27,7 +27,8 @@ const CtxServerName caddySshServerCtxKey = "CtxServerName"
 // TFTP is an example; put your own type here.
 type TFTP struct {
 	// The set of ssh servers keyed by custom names
-	Servers  map[string]*Server `json:"servers,omitempty"`
+	Servers map[string]*Server `json:"servers,omitempty"`
+
 	servers  []*tftpServer
 	ctx      caddy.Context
 	errGroup *errgroup.Group
@@ -51,15 +52,19 @@ type Server struct {
 	// An integer is interpreted as nanoseconds.
 	// If a string, it is a Go time.Duration value such as 300ms, 1.5h, or 2h45m;
 	// valid units are ns, us/µs, ms, s, m, h, and d.
-	Timeout time.Duration `json:"timeout,omitempty"`
+	Timeout caddy.Duration `json:"timeout,omitempty"`
+
+	// Enables access logging.
+	Logs bool `json:"logs,omitempty"`
 }
 
 type tftpServer struct {
 	*tftp.Server
-	name string
-	root string
-	addr caddy.NetworkAddress
-	log  *zap.Logger
+	name      string
+	root      string
+	addr      caddy.NetworkAddress
+	log       *zap.Logger
+	accessLog *zap.Logger
 }
 
 // CaddyModule returns the Caddy module information.
@@ -86,14 +91,16 @@ func (app *TFTP) Provision(ctx caddy.Context) error {
 			return fmt.Errorf("only 'udp' is supported in the listener addr")
 		}
 
+		log := ctx.Logger().Named(name)
 		s := &tftpServer{
-			name: name,
-			root: root,
-			addr: addr,
-			log:  ctx.Logger().Named(name),
+			name:      name,
+			root:      root,
+			addr:      addr,
+			log:       log,
+			accessLog: log.Named("access"),
 		}
 		tftpServer := tftp.NewServer(s.readHandler, s.writeHandler)
-		tftpServer.SetTimeout(srv.Timeout)
+		tftpServer.SetTimeout(time.Duration(srv.Timeout))
 		s.Server = tftpServer
 
 		app.servers = append(app.servers, s)
@@ -114,7 +121,12 @@ func (app *TFTP) Start() error {
 			return fmt.Errorf("tftp: failed to listen on %s: %v", s.addr, err)
 		}
 		app.errGroup.Go(func() error {
-			s.log.Info("tftp endpoint started", zap.String("address", s.addr.String()), zap.String("root", s.root))
+			s.log.Info(
+				"server running",
+				zap.String("name", s.name),
+				zap.String("address", s.addr.String()),
+				zap.String("root", s.root),
+			)
 			return s.Serve(l)
 		})
 	}
@@ -125,13 +137,42 @@ func (app *TFTP) Start() error {
 func (app *TFTP) Stop() error {
 	for _, s := range app.servers {
 		s.Shutdown()
-		s.log.Info("tftp endpoint stopped", zap.String("address", s.addr.String()), zap.String("root", s.root))
+		s.log.Info(
+			"server stopped",
+			zap.String("name", s.name),
+			zap.String("address", s.addr.String()),
+			zap.String("root", s.root),
+		)
 	}
 	return app.errGroup.Wait()
 }
 
 // readHandler is called when client starts file download from server
 func (s *tftpServer) readHandler(filename string, rf io.ReaderFrom) error {
+	var n int64
+	if s.accessLog != nil {
+		var remoteIP net.IP
+		var remotePort int
+		if ot, ok := rf.(tftp.OutgoingTransfer); ok {
+			remoteIP = ot.RemoteAddr().IP
+			remotePort = ot.RemoteAddr().Port
+		}
+		start := time.Now()
+		defer func() {
+			end := time.Now()
+			d := end.Sub(start)
+			s.accessLog.Info(
+				"handled request",
+				zap.String("remote_ip", remoteIP.String()),
+				zap.Int("remote_port", remotePort),
+				zap.String("method", "GET"),
+				zap.String("uri", filename),
+				zap.Int64("bytes_written", n),
+				zap.String("duration", d.String()),
+			)
+		}()
+	}
+
 	p, err := s.safePath(filename)
 	if err != nil {
 		s.log.Error(err.Error(), zap.String("filename", filename))
@@ -142,17 +183,40 @@ func (s *tftpServer) readHandler(filename string, rf io.ReaderFrom) error {
 		s.log.Error(err.Error(), zap.String("filename", filename))
 		return err
 	}
-	n, err := rf.ReadFrom(file)
+	n, err = rf.ReadFrom(file)
 	if err != nil {
 		s.log.Error(err.Error(), zap.String("filename", filename))
 		return err
 	}
-	s.log.Info(fmt.Sprintf("%d bytes sent", n))
 	return nil
 }
 
 // writeHandler is called when client starts file upload to server
 func (s *tftpServer) writeHandler(filename string, wt io.WriterTo) error {
+	var n int64
+	if s.accessLog != nil {
+		var remoteIP net.IP
+		var remotePort int
+		if ot, ok := wt.(tftp.IncomingTransfer); ok {
+			remoteIP = ot.RemoteAddr().IP
+			remotePort = ot.RemoteAddr().Port
+		}
+		start := time.Now()
+		defer func() {
+			end := time.Now()
+			d := end.Sub(start)
+			s.accessLog.Info(
+				"handled request",
+				zap.String("remote_ip", remoteIP.String()),
+				zap.Int("remote_port", remotePort),
+				zap.String("method", "PUT"),
+				zap.String("uri", filename),
+				zap.Int64("bytes_read", n),
+				zap.String("duration", d.String()),
+			)
+		}()
+	}
+
 	p, err := s.safePath(filename)
 	if err != nil {
 		s.log.Error(err.Error(), zap.String("filename", filename))
@@ -163,18 +227,23 @@ func (s *tftpServer) writeHandler(filename string, wt io.WriterTo) error {
 		s.log.Error(err.Error(), zap.String("filename", filename))
 		return err
 	}
-	n, err := wt.WriteTo(file)
+	n, err = wt.WriteTo(file)
 	if err != nil {
 		s.log.Error(err.Error(), zap.String("filename", filename))
 		return err
 	}
-	s.log.Info(fmt.Sprintf("%d bytes received", n))
 	return nil
 }
 
 func (s *tftpServer) safePath(filename string) (string, error) {
 	p := filepath.Join(s.root, filename)
 	c, err := filepath.Abs(p)
+	s.log.Debug(
+		"sanitized path join",
+		zap.String("root", s.root),
+		zap.String("filename", filename),
+		zap.String("result", c),
+	)
 	if err != nil || !strings.HasPrefix(c, s.root) {
 		return c, errors.New("unsafe or invalid filename specified")
 	} else {
