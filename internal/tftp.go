@@ -20,11 +20,6 @@ func init() {
 	caddy.RegisterModule(TFTP{})
 }
 
-type caddySshServerCtxKey string
-
-const CtxServerName caddySshServerCtxKey = "CtxServerName"
-
-// TFTP is an example; put your own type here.
 type TFTP struct {
 	// The set of ssh servers keyed by custom names
 	Servers map[string]*Server `json:"servers,omitempty"`

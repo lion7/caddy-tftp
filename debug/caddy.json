@@ -1,0 +1,14 @@
+{
+  "apps": {
+    "tftp": {
+      "servers": {
+        "": {
+          "listen": ":69",
+          "root": "files",
+          "timeout": "1s",
+          "logs": true
+        }
+      }
+    }
+  }
+}
